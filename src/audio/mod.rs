@@ -1,5 +1,6 @@
 pub mod effects;
 pub mod loudness;
+pub mod mic_effects;
 pub mod playback;
 pub mod virtual_device;
 

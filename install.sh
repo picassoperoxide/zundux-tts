@@ -24,6 +24,27 @@ escape_ere() {
     printf '%s' "$1" | sed -e 's/[][(){}.^$*+?|\\]/\\&/g'
 }
 
+# config.toml のトップレベルにキーを設定する（既存なら置換、無ければ最初のテーブルの前に挿入）。
+# 末尾に追記すると最後の [table] の中に入ってしまいアプリから読まれないため、必ずトップレベルに書く。
+# $3 は TOML の値としてそのまま書かれる（文字列なら呼び出し側で "..." を付ける）。
+set_toplevel_key() {
+    local file="$1" tmp
+    tmp="$(mktemp)"
+    KEY="$2" LINE="$2 = $3" awk '
+        BEGIN { done = 0; top = 1; key = ENVIRON["KEY"]; line = ENVIRON["LINE"] }
+        top && /^[[:space:]]*\[/ { if (!done) { print line; done = 1 } top = 0 }
+        top {
+            s = $0; sub(/^[[:space:]]+/, "", s)
+            if (index(s, key) == 1 && substr(s, length(key) + 1) ~ /^[[:space:]]*=/) {
+                if (!done) { print line; done = 1 }
+                next
+            }
+        }
+        { print }
+        END { if (!done) print line }
+    ' "$file" > "$tmp" && mv "$tmp" "$file"
+}
+
 download_binary() {
     info "最新リリースをダウンロード中..."
 
@@ -370,18 +391,9 @@ fi
 
 # Update config with VOICEVOX Docker settings
 if [ -f "$CONFIG_DIR/config.toml" ]; then
-    # Update existing config
-    if grep -q 'voicevox_path' "$CONFIG_DIR/config.toml"; then
-        sed -i "s|^voicevox_path.*|voicevox_path = \"$DOCKER_CMD\"|" "$CONFIG_DIR/config.toml"
-    else
-        echo "voicevox_path = \"$DOCKER_CMD\"" >> "$CONFIG_DIR/config.toml"
-    fi
-    # Set auto_launch_voicevox = true
-    if grep -q 'auto_launch_voicevox' "$CONFIG_DIR/config.toml"; then
-        sed -i 's|^auto_launch_voicevox.*|auto_launch_voicevox = true|' "$CONFIG_DIR/config.toml"
-    else
-        echo "auto_launch_voicevox = true" >> "$CONFIG_DIR/config.toml"
-    fi
+    # Update existing config (top-level keys win over [engine_configs.*] mirrors)
+    set_toplevel_key "$CONFIG_DIR/config.toml" "voicevox_path" "\"$DOCKER_CMD\""
+    set_toplevel_key "$CONFIG_DIR/config.toml" "auto_launch_voicevox" "true"
 else
     # Create minimal config
     cat > "$CONFIG_DIR/config.toml" << CONFIG_EOF
@@ -611,12 +623,7 @@ print('ずんだもんモデルのダウンロード完了')
 
     # --- config.tomlにVoiceger設定を書き込む ---
     update_or_append() {
-        local key="$1" val="$2"
-        if grep -q "^${key}" "$CONFIG_DIR/config.toml"; then
-            sed -i "s|^${key}.*|${key} = \"${val}\"|" "$CONFIG_DIR/config.toml"
-        else
-            echo "${key} = \"${val}\"" >> "$CONFIG_DIR/config.toml"
-        fi
+        set_toplevel_key "$CONFIG_DIR/config.toml" "$1" "\"$2\""
     }
     update_or_append "voiceger_path"      "$VOICEGER_CMD"
     update_or_append "voiceger_ref_audio" "$VOICEGER_REF_AUDIO"

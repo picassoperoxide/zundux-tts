@@ -172,10 +172,17 @@ pub struct ZunduxApp {
     ui_tx: mpsc::Sender<UiMessage>,
     desktop_capture: crate::media::desktop_capture::DesktopCapture,
     needs_theme_update: bool,
+    /// Echo settings shared with the mic effect pipeline (updated every frame).
+    mic_echo_params: Arc<crate::audio::mic_effects::MicEchoParams>,
+    /// Whether echo was requested when the mic passthrough was last (re)connected.
+    mic_echo_requested: bool,
+    /// Whether the virtual mic is currently set as the system default input by us.
+    default_input_applied: bool,
 }
 
 const HEALTH_CHECK_INTERVAL_SECS: u64 = 5;
 const HEALTH_CHECK_INTERVAL_LAUNCHING_SECS: u64 = 1;
+const VOICEGER_LOG_PATH: &str = "/tmp/zundux_voiceger.log";
 
 impl ZunduxApp {
     pub fn new(config: AppConfig, rt: tokio::runtime::Handle) -> Self {
@@ -193,6 +200,10 @@ impl ZunduxApp {
 
         crate::media::desktop_capture::DesktopCapture::cleanup_stale();
         audio_manager.virtual_device.cleanup_stale_loopbacks();
+        let mic_echo_params = Arc::new(crate::audio::mic_effects::MicEchoParams::new(
+            config.echo_delay_ms,
+            config.echo_decay,
+        ));
 
         // Spawn the TTS command processing loop on tokio
         let voicevox_url = config.voicevox_url.clone();
@@ -316,6 +327,69 @@ impl ZunduxApp {
             ui_tx: ui_tx_clone,
             desktop_capture: crate::media::desktop_capture::DesktopCapture::new(),
             needs_theme_update: true,
+            mic_echo_params,
+            mic_echo_requested: false,
+            default_input_applied: false,
+        }
+    }
+
+    /// Echo params for the mic, or `None` when the mic should stay dry
+    /// (echo off, or effects limited to the synthesized voice).
+    fn mic_echo(&self) -> Option<Arc<crate::audio::mic_effects::MicEchoParams>> {
+        let config = &self.state.config;
+        (config.echo_enabled && !config.effects_tts_only).then(|| Arc::clone(&self.mic_echo_params))
+    }
+
+    /// The real microphone to pass through. When none is selected we must not use
+    /// `@DEFAULT_SOURCE@` blindly: with "PCの既定の入力" ON it is our own virtual mic.
+    fn mic_source(&self) -> String {
+        let device = &self.audio_manager.virtual_device;
+        self.state
+            .config
+            .mic_source_name
+            .clone()
+            .filter(|name| !device.is_own_source(name))
+            .or_else(|| device.previous_default_source().map(str::to_string))
+            .unwrap_or_else(|| "@DEFAULT_SOURCE@".to_string())
+    }
+
+    fn enable_mic_passthrough(&mut self, source: &str) -> anyhow::Result<()> {
+        let echo = self.mic_echo();
+        self.mic_echo_requested = echo.is_some();
+        self.audio_manager.virtual_device.enable_mic_passthrough(
+            source,
+            self.state.config.noise_suppression,
+            echo,
+        )
+    }
+
+    /// Keep live audio settings in sync with the config each frame.
+    fn sync_audio_settings(&mut self) {
+        self.mic_echo_params.set(
+            self.state.config.echo_delay_ms,
+            self.state.config.echo_decay,
+        );
+
+        // Echo on/off or "TTS only" toggled while the mic is on → reconnect so the
+        // mic switches between the plain loopback and the effect pipeline.
+        if self.state.mic_passthrough && self.mic_echo().is_some() != self.mic_echo_requested {
+            self.state.pending_reconnect_mic = true;
+        }
+
+        let want_default = self.state.config.use_as_default_input && self.state.device_ready;
+        if want_default != self.default_input_applied {
+            self.default_input_applied = want_default;
+            if want_default {
+                if let Err(e) = self.audio_manager.virtual_device.set_as_default_source() {
+                    tracing::warn!("Failed to set default input: {}", e);
+                    self.state.last_error = Some(format!("既定の入力デバイス設定失敗: {}", e));
+                    // Don't retry every frame; the user can toggle again.
+                    self.state.config.use_as_default_input = false;
+                    self.default_input_applied = false;
+                }
+            } else {
+                self.audio_manager.virtual_device.restore_default_source();
+            }
         }
     }
 
@@ -430,16 +504,17 @@ impl ZunduxApp {
                 }
                 TtsCommand::LoadSpeakers { engine_id, config } => {
                     let normalized_engine_id = Self::normalize_engine_id(&engine_id);
-                    let engine =
-                        match Self::resolve_engine_for_command(&registry, &engine_id, config.as_ref())
-                        {
-                            Ok(engine) => engine,
-                            Err(e) => {
-                                let _ =
-                                    tx.send(UiMessage::Error(format!("スピーカー取得失敗: {}", e)));
-                                continue;
-                            }
-                        };
+                    let engine = match Self::resolve_engine_for_command(
+                        &registry,
+                        &engine_id,
+                        config.as_ref(),
+                    ) {
+                        Ok(engine) => engine,
+                        Err(e) => {
+                            let _ = tx.send(UiMessage::Error(format!("スピーカー取得失敗: {}", e)));
+                            continue;
+                        }
+                    };
                     match engine.list_speakers().await {
                         Ok(speakers) => {
                             let _ = tx.send(UiMessage::SpeakersLoaded {
@@ -449,10 +524,8 @@ impl ZunduxApp {
                         }
                         Err(e) => {
                             if normalized_engine_id != ENGINE_ID_GENERIC {
-                                let _ = tx.send(UiMessage::Error(format!(
-                                    "スピーカー取得失敗: {}",
-                                    e
-                                )));
+                                let _ =
+                                    tx.send(UiMessage::Error(format!("スピーカー取得失敗: {}", e)));
                             }
                         }
                     }
@@ -675,6 +748,7 @@ impl ZunduxApp {
         };
         if self.last_health_check.elapsed().as_secs() >= interval {
             self.last_health_check = Instant::now();
+            self.check_voiceger_process_exit();
             let _ = self.tts_tx.send(TtsCommand::HealthCheck {
                 engine_id: ENGINE_ID_VOICEVOX.to_string(),
                 config: None,
@@ -693,6 +767,29 @@ impl ZunduxApp {
                 engine_id: ENGINE_ID_GENERIC.to_string(),
                 config: Some(EngineCommandConfig::Generic { url: generic_url }),
             });
+        }
+    }
+
+    /// If the Voiceger process we spawned has already exited, stop showing
+    /// "起動中..." forever and point the user at the server log instead.
+    fn check_voiceger_process_exit(&mut self) {
+        let Some(proc) = self.voiceger_process.as_mut() else {
+            return;
+        };
+        match proc.try_wait() {
+            Ok(Some(status)) => {
+                self.voiceger_process = None;
+                if !self.state.voiceger_connected {
+                    tracing::error!("Voiceger process exited during startup: {}", status);
+                    self.state.voiceger_launching = false;
+                    self.state.last_error = Some(format!(
+                        "Voicegerが起動直後に終了しました ({})。ログ: {}",
+                        status, VOICEGER_LOG_PATH
+                    ));
+                }
+            }
+            Ok(None) => {}
+            Err(e) => tracing::warn!("Failed to poll Voiceger process: {}", e),
         }
     }
 
@@ -732,7 +829,10 @@ impl ZunduxApp {
                 // Voiceger requires a preset — language cannot be inferred without one.
                 let voiceger_no_preset = is_voiceger
                     && active_preset
-                        .map(|p| Self::normalize_engine_id(&Self::preset_engine_id(p)) != ENGINE_ID_VOICEGER)
+                        .map(|p| {
+                            Self::normalize_engine_id(&Self::preset_engine_id(p))
+                                != ENGINE_ID_VOICEGER
+                        })
                         .unwrap_or(true);
                 if voiceger_no_preset {
                     self.state.last_error =
@@ -1013,6 +1113,8 @@ impl ZunduxApp {
         if self.state.pending_create_device {
             self.state.pending_create_device = false;
             self.audio_manager = AudioManager::new(&self.state.config.virtual_device_name);
+            // The old device restored the default input on drop; re-apply it if wanted.
+            self.default_input_applied = false;
             match self.audio_manager.ensure_device() {
                 Ok(()) => {
                     self.state.device_ready = true;
@@ -1030,6 +1132,7 @@ impl ZunduxApp {
             match self.audio_manager.destroy_device() {
                 Ok(()) => {
                     self.state.device_ready = false;
+                    self.default_input_applied = false;
                     self.state.last_error = None;
                 }
                 Err(e) => {
@@ -1126,7 +1229,10 @@ impl ZunduxApp {
         if self.state.pending_refresh_mic_sources {
             self.state.pending_refresh_mic_sources = false;
             match crate::audio::virtual_device::VirtualDevice::list_sources() {
-                Ok(sources) => {
+                Ok(mut sources) => {
+                    // Our own virtual mic must never be the passthrough source (feedback loop).
+                    let device = &self.audio_manager.virtual_device;
+                    sources.retain(|(name, _)| !device.is_own_source(name));
                     // Auto-select first source if none configured
                     if self.state.config.mic_source_name.is_none() {
                         if let Some((name, _)) = sources.first() {
@@ -1151,20 +1257,13 @@ impl ZunduxApp {
             let result = if was_on {
                 self.audio_manager.virtual_device.disable_mic_passthrough()
             } else {
-                let source = self
-                    .state
-                    .config
-                    .mic_source_name
-                    .as_deref()
-                    .unwrap_or("@DEFAULT_SOURCE@");
+                let source = self.mic_source();
                 tracing::info!("Enabling mic passthrough with source: {}", source);
                 // Ensure sink is unmuted (STOP may have muted it)
                 let _ = std::process::Command::new("pactl")
                     .args(["set-sink-mute", &self.state.config.virtual_device_name, "0"])
                     .output();
-                self.audio_manager
-                    .virtual_device
-                    .enable_mic_passthrough(source, self.state.config.noise_suppression)
+                self.enable_mic_passthrough(&source)
             };
             match result {
                 Ok(()) => {
@@ -1191,19 +1290,10 @@ impl ZunduxApp {
         // Reconnect mic loopback with newly selected source
         if self.state.pending_reconnect_mic {
             self.state.pending_reconnect_mic = false;
-            let source = self
-                .state
-                .config
-                .mic_source_name
-                .as_deref()
-                .unwrap_or("@DEFAULT_SOURCE@");
+            let source = self.mic_source();
             tracing::info!("Reconnecting mic loopback with source: {}", source);
             let _ = self.audio_manager.virtual_device.disable_mic_passthrough();
-            match self
-                .audio_manager
-                .virtual_device
-                .enable_mic_passthrough(source, self.state.config.noise_suppression)
-            {
+            match self.enable_mic_passthrough(&source) {
                 Ok(()) => {
                     self.state.mic_passthrough =
                         self.audio_manager.virtual_device.is_mic_passthrough();
@@ -1568,15 +1658,27 @@ impl ZunduxApp {
         let log_file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open("/tmp/zundux_voiceger.log")
+            .open(VOICEGER_LOG_PATH)
             .ok();
+        if let Some(mut f) = log_file.as_ref() {
+            use std::io::Write as _;
+            let _ = writeln!(
+                f,
+                "=== zundux: launching Voiceger: {} (cwd: {}) ===",
+                path,
+                workdir
+                    .as_ref()
+                    .map(|d| d.display().to_string())
+                    .unwrap_or_else(|| "<inherited>".to_string())
+            );
+        }
         let (stdout_io, stderr_io) = match log_file {
             Some(f) => {
                 let f2 = f.try_clone().unwrap_or_else(|_| {
                     std::fs::OpenOptions::new()
                         .create(true)
                         .append(true)
-                        .open("/tmp/zundux_voiceger.log")
+                        .open(VOICEGER_LOG_PATH)
                         .unwrap()
                 });
                 (std::process::Stdio::from(f), std::process::Stdio::from(f2))
@@ -1807,6 +1909,7 @@ impl eframe::App for ZunduxApp {
         }
         self.state.is_soundboard_playing = self.is_soundboard_playing.load(Ordering::SeqCst);
         self.periodic_health_check();
+        self.sync_audio_settings();
         self.process_actions();
 
         let theme = &self.state.config.theme;

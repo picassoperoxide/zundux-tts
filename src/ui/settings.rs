@@ -1,6 +1,7 @@
 use crate::app::AppState;
 use crate::config::{AppConfig, GenericEngineConfig, TtsEngineType, ENGINE_ID_GENERIC};
 use crate::tts::voiceger::VOICEGER_LANGUAGES;
+use crate::ui::widgets;
 use crate::validation;
 
 const PRESET_REF_WAV_BUTTONS_WIDTH: f32 = 120.0;
@@ -292,335 +293,620 @@ fn show_preset_section(
     }
 }
 
-/// 非アクティブエンジンのセクション上部に表示する警告ノーティス。
-fn show_inactive_notice(ui: &mut egui::Ui, state: &AppState) {
-    let active_name = match &state.config.active_engine {
+fn engine_display_name(state: &AppState) -> String {
+    match state.config.active_engine {
         TtsEngineType::Voicevox => "VOICEVOX".to_string(),
         TtsEngineType::Voiceger => "Voiceger".to_string(),
         TtsEngineType::Generic => state.config.active_generic_name().to_string(),
+    }
+}
+
+/// Small bold heading used inside a section instead of another nested collapsing header.
+fn sub_heading(ui: &mut egui::Ui, text: &str) {
+    ui.add_space(8.0);
+    ui.label(egui::RichText::new(text).strong());
+    ui.add_space(2.0);
+}
+
+fn hint(ui: &mut egui::Ui, text: &str) {
+    ui.label(egui::RichText::new(text).small().weak());
+}
+
+/// "接続OK / 起動中... / 未接続" lamp.
+fn connection_status(ui: &mut egui::Ui, state: &AppState, connected: bool, launching: bool) {
+    let theme = &state.config.theme;
+    if connected {
+        ui.colored_label(theme.color(theme.status_ok), "● 接続OK");
+    } else if launching {
+        ui.colored_label(theme.color(theme.status_warn), "● 起動中...");
+    } else {
+        ui.colored_label(theme.color(theme.status_error), "● 未接続");
+    }
+}
+
+/// Banner at the top of an engine section: either "使用中" or a button to switch to it.
+fn engine_usage_banner(ui: &mut egui::Ui, state: &mut AppState, engine: TtsEngineType) {
+    let is_active = state.config.active_engine == engine;
+    ui.horizontal(|ui| {
+        if is_active {
+            ui.colored_label(
+                state.config.theme.color(state.config.theme.status_ok),
+                "✔ 現在このエンジンを使用中",
+            );
+        } else {
+            ui.label(
+                egui::RichText::new(format!("現在は {} を使用中", engine_display_name(state)))
+                    .weak(),
+            );
+            if ui.button("このエンジンを使う").clicked() {
+                state.pending_switch_engine = Some(engine);
+            }
+        }
+    });
+}
+
+/// Engine picker at the top of the settings: VOICEVOX / Voiceger / その他.
+fn show_engine_selector(ui: &mut egui::Ui, state: &mut AppState) {
+    ui.label(egui::RichText::new("使用するTTSエンジン").strong());
+    ui.add_space(4.0);
+    ui.horizontal_wrapped(|ui| {
+        let active = state.config.active_engine;
+        if ui
+            .radio(active == TtsEngineType::Voicevox, "VOICEVOX")
+            .clicked()
+            && active != TtsEngineType::Voicevox
+        {
+            state.pending_switch_engine = Some(TtsEngineType::Voicevox);
+        }
+        if ui
+            .radio(active == TtsEngineType::Voiceger, "Voiceger")
+            .clicked()
+            && active != TtsEngineType::Voiceger
+        {
+            state.pending_switch_engine = Some(TtsEngineType::Voiceger);
+        }
+
+        let is_other = active == TtsEngineType::Generic;
+        if state.config.generic_engines.is_empty() {
+            ui.add_enabled(false, egui::RadioButton::new(false, "その他"))
+                .on_disabled_hover_text("下の「その他のエンジン」から追加できます");
+        } else {
+            if ui.radio(is_other, "その他:").clicked() && !is_other {
+                state.generic_connected = false;
+                state.pending_switch_engine = Some(TtsEngineType::Generic);
+            }
+            let selected = state.config.active_generic_name().to_string();
+            let mut picked: Option<usize> = None;
+            egui::ComboBox::from_id_salt("other_engine_picker")
+                .selected_text(selected)
+                .show_ui(ui, |ui| {
+                    for (i, engine) in state.config.generic_engines.iter().enumerate() {
+                        let is_this = is_other && state.config.active_generic_engine_idx == i;
+                        if ui.selectable_label(is_this, &engine.name).clicked() && !is_this {
+                            picked = Some(i);
+                        }
+                    }
+                });
+            if let Some(i) = picked {
+                state.config.active_generic_engine_idx = i;
+                state.generic_connected = false;
+                state.pending_switch_engine = Some(TtsEngineType::Generic);
+            }
+        }
+    });
+
+    ui.add_space(4.0);
+    let (connected, launching) = match state.config.active_engine {
+        TtsEngineType::Voicevox => (state.voicevox_connected, state.voicevox_launching),
+        TtsEngineType::Voiceger => (state.voiceger_connected, state.voiceger_launching),
+        TtsEngineType::Generic => (state.generic_connected, false),
     };
     ui.horizontal(|ui| {
-        ui.colored_label(
-            state.config.theme.color(state.config.theme.status_warn),
-            "⚠",
-        );
-        ui.label(
-            egui::RichText::new(format!("現在 {} を使用中のため変更できません", active_name))
-                .small()
-                .weak(),
+        ui.label(format!("{}:", engine_display_name(state)));
+        connection_status(ui, state, connected, launching);
+        match state.config.active_engine {
+            TtsEngineType::Voicevox => {
+                if ui.small_button("再起動").clicked() {
+                    state.pending_restart_voicevox = true;
+                }
+            }
+            TtsEngineType::Voiceger => {
+                if ui.small_button("再起動").clicked() {
+                    state.pending_restart_voiceger = true;
+                }
+            }
+            TtsEngineType::Generic => {
+                if ui.small_button("接続確認").clicked() {
+                    state.generic_connected = false;
+                    state.pending_health_check_generic = true;
+                }
+            }
+        }
+    });
+}
+
+fn show_voicevox_section(ui: &mut egui::Ui, state: &mut AppState) {
+    engine_usage_banner(ui, state, TtsEngineType::Voicevox);
+
+    sub_heading(ui, "接続・起動");
+    ui.horizontal(|ui| {
+        if ui.button("接続テスト").clicked() {
+            state.pending_health_check = true;
+        }
+        if ui.button("起動").clicked() {
+            state.pending_launch_voicevox = true;
+        }
+        connection_status(
+            ui,
+            state,
+            state.voicevox_connected,
+            state.voicevox_launching,
         );
     });
+    ui.horizontal(|ui| {
+        ui.label("URL:");
+        ui.text_edit_singleline(&mut state.config.voicevox_url);
+    });
+    if validation::is_valid_voicevox_url(&state.config.voicevox_url).is_err() {
+        ui.colored_label(
+            state.config.theme.color(state.config.theme.status_warn),
+            "URLはhttp://localhost または http://127.0.0.1 のみ",
+        );
+    }
+    ui.horizontal(|ui| {
+        ui.label("実行パス/コマンド:");
+        ui.add(
+            egui::TextEdit::singleline(&mut state.config.voicevox_path)
+                .hint_text("空欄 = 起動済みのVOICEVOXにURLで接続"),
+        );
+        if ui.button("参照").clicked() {
+            if let Some(path) = rfd::FileDialog::new().pick_file() {
+                state.config.voicevox_path = path.to_string_lossy().to_string();
+            }
+        }
+    });
+    hint(
+        ui,
+        "空欄でも外部で起動済みのVOICEVOXにURL接続できます。起動/自動起動には実行パス/コマンドが必要です。",
+    );
+    let theme = state.config.theme.clone();
+    if widgets::toggle(
+        ui,
+        &theme,
+        &mut state.config.auto_launch_voicevox,
+        "アプリ起動時にVOICEVOXを自動起動",
+    )
+    .changed()
+    {
+        let _ = state.config.save();
+    }
+
+    sub_heading(ui, "音声パラメータ（プリセット未選択時）");
+    let params = &mut state.config.synth_params;
+    ui.horizontal(|ui| {
+        ui.label("速度:");
+        ui.add(egui::Slider::new(&mut params.speed_scale, 0.5..=2.0).step_by(0.05));
+    });
+    ui.horizontal(|ui| {
+        ui.label("ピッチ:");
+        ui.add(egui::Slider::new(&mut params.pitch_scale, -0.15..=0.15).step_by(0.01));
+    });
+    ui.horizontal(|ui| {
+        ui.label("抑揚:");
+        ui.add(egui::Slider::new(&mut params.intonation_scale, 0.0..=2.0).step_by(0.05));
+    });
+    ui.horizontal(|ui| {
+        ui.label("音量:");
+        ui.add(egui::Slider::new(&mut params.volume_scale, 0.0..=2.0).step_by(0.05));
+    });
+    if ui.button("デフォルトに戻す").clicked() {
+        *params = crate::config::SynthParamsConfig::default();
+    }
+
+    sub_heading(ui, "プリセット");
+    show_preset_section(ui, state, &TtsEngineType::Voicevox, None);
+
     ui.add_space(4.0);
+    ui.collapsing("VOICEVOX辞書", |ui| {
+        if !state.voicevox_connected {
+            ui.label("VOICEVOXに接続してください");
+            return;
+        }
+        ui.horizontal(|ui| {
+            if ui.button("辞書を読み込む").clicked() {
+                state.pending_load_user_dict = true;
+            }
+            hint(ui, "(読み込んでいただくことで既存の割り当てを見られます)");
+        });
+        ui.add_space(4.0);
+
+        let mut to_delete = None;
+        for (uuid, surface, pronunciation) in &state.user_dict {
+            ui.horizontal(|ui| {
+                ui.label(format!("{} → {}", surface, pronunciation));
+                if ui.small_button("削除").clicked() {
+                    to_delete = Some(uuid.clone());
+                }
+            });
+        }
+        if let Some(uuid) = to_delete {
+            state.pending_delete_dict_word = Some(uuid);
+        }
+
+        ui.add_space(4.0);
+        ui.separator();
+
+        ui.horizontal(|ui| {
+            ui.label("表記:");
+            ui.add(egui::TextEdit::singleline(&mut state.new_dict_surface).desired_width(100.0));
+            ui.label("読み:");
+            ui.add(
+                egui::TextEdit::singleline(&mut state.new_dict_pronunciation).desired_width(100.0),
+            );
+            if ui.button("追加").clicked()
+                && !state.new_dict_surface.trim().is_empty()
+                && !state.new_dict_pronunciation.trim().is_empty()
+            {
+                let surface = state.new_dict_surface.trim().to_string();
+                let pronunciation = state.new_dict_pronunciation.trim().to_string();
+                state.pending_add_dict_word = Some((surface, pronunciation));
+                state.new_dict_surface.clear();
+                state.new_dict_pronunciation.clear();
+            }
+        });
+    });
+}
+
+fn show_voiceger_section(ui: &mut egui::Ui, state: &mut AppState) {
+    engine_usage_banner(ui, state, TtsEngineType::Voiceger);
+
+    sub_heading(ui, "接続・起動");
+    ui.horizontal(|ui| {
+        if ui.button("起動").clicked() {
+            state.pending_launch_voiceger = true;
+        }
+        if ui.button("再起動").clicked() {
+            state.pending_restart_voiceger = true;
+        }
+        connection_status(
+            ui,
+            state,
+            state.voiceger_connected,
+            state.voiceger_launching,
+        );
+    });
+    ui.horizontal(|ui| {
+        ui.label("URL:");
+        ui.text_edit_singleline(&mut state.config.voiceger_url);
+    });
+    ui.horizontal(|ui| {
+        ui.label("起動コマンド:");
+        ui.add(
+            egui::TextEdit::singleline(&mut state.config.voiceger_path)
+                .hint_text("空欄 = ~/voiceger_v2 のデフォルトコマンドを使用"),
+        );
+        if ui.button("参照").clicked() {
+            if let Some(path) = rfd::FileDialog::new().pick_file() {
+                state.config.voiceger_path = path.to_string_lossy().to_string();
+                let _ = state.config.save();
+            }
+        }
+    });
+    hint(
+        ui,
+        "起動できない場合はサーバーのログ /tmp/zundux_voiceger.log を確認してください",
+    );
+    let theme = state.config.theme.clone();
+    if widgets::toggle(
+        ui,
+        &theme,
+        &mut state.config.auto_launch_voiceger,
+        "アプリ起動時にVoicegerを自動起動",
+    )
+    .changed()
+    {
+        let _ = state.config.save();
+    }
+
+    sub_heading(ui, "参照音声");
+    ui.horizontal(|ui| {
+        ui.label("参照音声:");
+        ui.add(
+            egui::TextEdit::singleline(&mut state.config.voiceger_ref_audio)
+                .hint_text("参照音声のパス"),
+        );
+        if ui.button("参照").clicked() {
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter("音声ファイル", &["wav", "flac", "mp3", "ogg", "m4a", "aac"])
+                .pick_file()
+            {
+                state.config.voiceger_ref_audio = path.to_string_lossy().to_string();
+                let _ = state.config.save();
+            }
+        }
+    });
+    hint(
+        ui,
+        "⚠ WAV・FLACを推奨。MP3・AACは非可逆圧縮のため高周波が欠落し、声質の再現精度が下がる場合があります。",
+    );
+    ui.horizontal(|ui| {
+        ui.label("参照言語:");
+        egui::ComboBox::from_id_salt("voiceger_prompt_lang")
+            .selected_text(&state.config.voiceger_prompt_lang)
+            .show_ui(ui, |ui| {
+                for (code, name, _) in VOICEGER_LANGUAGES {
+                    ui.selectable_value(
+                        &mut state.config.voiceger_prompt_lang,
+                        code.to_string(),
+                        *name,
+                    );
+                }
+            });
+    });
+    ui.horizontal(|ui| {
+        ui.label("参照テキスト:");
+        let resp = ui.add(
+            egui::TextEdit::singleline(&mut state.config.voiceger_prompt_text)
+                .hint_text("参照音声が喋っている内容"),
+        );
+        if resp.lost_focus() {
+            let _ = state.config.save();
+        }
+    });
+    widgets::toggle(
+        ui,
+        &theme,
+        &mut state.config.voiceger_ref_free,
+        "参照なしモード (ref_free) を常に使う",
+    );
+    hint(
+        ui,
+        "ON: 参照音声/参照テキストを使わず合成します。OFFでも短い英字（例: wa）や短い日本語（例: いいかな？）は自動で参照なしになります。",
+    );
+    ui.add_space(4.0);
+    if ui.button("参照音声設定をデフォルトに戻す").clicked() {
+        state.config.reset_voiceger_defaults();
+        let _ = state.config.save();
+    }
+    hint(
+        ui,
+        "参照音声は {voicegerのフォルダ}/reference/ 以下にあります",
+    );
+
+    sub_heading(ui, "プリセット");
+    show_preset_section(ui, state, &TtsEngineType::Voiceger, None);
+
+    ui.add_space(4.0);
+    ui.collapsing("Voiceger辞書", |ui| show_voiceger_dict(ui, state));
+}
+
+/// Per-language pronunciation replacements + shared silent words.
+fn show_voiceger_dict(ui: &mut egui::Ui, state: &mut AppState) {
+    hint(ui, "送信前にテキストを置換します（言語ごとに独立）");
+    ui.add_space(4.0);
+
+    ui.horizontal(|ui| {
+        for (code, name, _) in VOICEGER_LANGUAGES {
+            let selected = state.voiceger_dict_lang == *code;
+            if ui.selectable_label(selected, *name).clicked() {
+                state.voiceger_dict_lang = code.to_string();
+            }
+        }
+    });
+    ui.separator();
+
+    let lang = state.voiceger_dict_lang.clone();
+
+    let mut to_delete_key: Option<String> = None;
+    if let Some(lang_dict) = state.config.voiceger_dict.get(&lang) {
+        let mut sorted: Vec<(String, String)> = lang_dict
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        sorted.sort_by(|a, b| a.0.cmp(&b.0));
+        for (surface, reading) in &sorted {
+            ui.horizontal(|ui| {
+                ui.label(format!("{} → {}", surface, reading));
+                if ui.small_button("削除").clicked() {
+                    to_delete_key = Some(surface.clone());
+                }
+            });
+        }
+    }
+    if let Some(key) = to_delete_key {
+        if let Some(d) = state.config.voiceger_dict.get_mut(&lang) {
+            d.remove(&key);
+        }
+        let _ = state.config.save();
+    }
+
+    if !state.config.silent_words.is_empty() {
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new("無音化（両エンジン共通）")
+                .size(9.0)
+                .color(state.config.theme.color(state.config.theme.text_muted)),
+        );
+        let mut silent_to_delete = None;
+        for (i, word) in state.config.silent_words.iter().enumerate() {
+            ui.horizontal(|ui| {
+                ui.label(format!("{} → (無音)", word));
+                if ui.small_button("削除").clicked() {
+                    silent_to_delete = Some(i);
+                }
+            });
+        }
+        if let Some(idx) = silent_to_delete {
+            state.config.silent_words.remove(idx);
+            let _ = state.config.save();
+        }
+    }
+
+    ui.add_space(4.0);
+    ui.separator();
+
+    ui.horizontal(|ui| {
+        ui.label("表記:");
+        ui.add(egui::TextEdit::singleline(&mut state.new_dict_surface).desired_width(90.0));
+        ui.label("読み:");
+        ui.add(
+            egui::TextEdit::singleline(&mut state.new_dict_pronunciation)
+                .desired_width(90.0)
+                .hint_text("{silent}で無音化"),
+        );
+        if ui.button("追加").clicked()
+            && !state.new_dict_surface.trim().is_empty()
+            && !state.new_dict_pronunciation.trim().is_empty()
+        {
+            let surface = state.new_dict_surface.trim().to_string();
+            let reading = state.new_dict_pronunciation.trim().to_string();
+            if reading == "{silent}" {
+                if !state.config.silent_words.contains(&surface) {
+                    state.config.silent_words.push(surface);
+                }
+            } else {
+                state
+                    .config
+                    .voiceger_dict
+                    .entry(lang.clone())
+                    .or_default()
+                    .insert(surface, reading);
+            }
+            let _ = state.config.save();
+            state.new_dict_surface.clear();
+            state.new_dict_pronunciation.clear();
+        }
+    });
+}
+
+/// VOICEVOX-compatible engines the user added themselves.
+fn show_other_engines_section(ui: &mut egui::Ui, state: &mut AppState) {
+    hint(
+        ui,
+        "VOICEVOX互換API（/speakers, /audio_query, /synthesis）を持つエンジンを追加できます。",
+    );
+    ui.add_space(4.0);
+
+    let mut to_delete: Option<usize> = None;
+    let mut to_use: Option<usize> = None;
+    for i in 0..state.config.generic_engines.len() {
+        let is_active = state.config.active_engine == TtsEngineType::Generic
+            && state.config.active_generic_engine_idx == i;
+        ui.group(|ui| {
+            ui.horizontal(|ui| {
+                ui.label("名前:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut state.config.generic_engines[i].name)
+                        .desired_width(140.0)
+                        .hint_text("エンジン名")
+                        .id_salt(("gen_mgmt_name", i)),
+                );
+                if is_active {
+                    ui.colored_label(
+                        state.config.theme.color(state.config.theme.status_ok),
+                        "✔ 使用中",
+                    );
+                } else if ui.small_button("このエンジンを使う").clicked() {
+                    to_use = Some(i);
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("URL:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut state.config.generic_engines[i].url)
+                        .desired_width(ui.available_width())
+                        .hint_text("http://localhost:10101")
+                        .id_salt(("gen_mgmt_url", i)),
+                );
+            });
+            ui.horizontal(|ui| {
+                if is_active {
+                    if ui.button("接続確認").clicked() {
+                        state.generic_connected = false;
+                        state.pending_health_check_generic = true;
+                    }
+                    connection_status(ui, state, state.generic_connected, false);
+                }
+                if ui
+                    .add(egui::Button::new(egui::RichText::new("削除").color(
+                        state.config.theme.color(state.config.theme.status_error),
+                    )))
+                    .clicked()
+                {
+                    to_delete = Some(i);
+                }
+            });
+            let engine_name = state.config.generic_engines[i].name.clone();
+            ui.collapsing(format!("{} のプリセット", engine_name), |ui| {
+                // Presets are keyed by engine; they are only usable while it is active.
+                if !is_active {
+                    hint(ui, "このエンジンを使うとプリセットを選択できます");
+                }
+                show_preset_section(ui, state, &TtsEngineType::Generic, Some(&engine_name));
+            });
+        });
+        ui.add_space(4.0);
+    }
+
+    if let Some(i) = to_use {
+        state.config.active_generic_engine_idx = i;
+        state.generic_connected = false;
+        state.pending_switch_engine = Some(TtsEngineType::Generic);
+    }
+
+    if let Some(i) = to_delete {
+        let was_active = state.config.active_engine == TtsEngineType::Generic
+            && state.config.active_generic_engine_idx == i;
+        state.config.generic_engines.remove(i);
+        if state.config.active_generic_engine_idx > i
+            || state.config.active_generic_engine_idx >= state.config.generic_engines.len()
+        {
+            state.config.active_generic_engine_idx =
+                state.config.active_generic_engine_idx.saturating_sub(1);
+        }
+        if was_active {
+            // The engine in use is gone — fall back to VOICEVOX.
+            state.pending_switch_engine = Some(TtsEngineType::Voicevox);
+        }
+        let _ = state.config.save();
+    }
+
+    let num_engines = state.config.generic_engines.len();
+    if num_engines < 20 && ui.button("＋ エンジンを追加").clicked() {
+        state.config.generic_engines.push(GenericEngineConfig {
+            name: format!("エンジン{}", num_engines + 1),
+            url: "http://localhost:10101".to_string(),
+        });
+        let _ = state.config.save();
+    }
 }
 
 pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
+    let theme = state.config.theme.clone();
     egui::ScrollArea::vertical().show(ui, |ui| {
         ui.heading("設定");
         ui.separator();
 
-        // ── Engine selector (always visible, no collapsing) ──────────────
         ui.add_space(4.0);
-        ui.label(egui::RichText::new("TTSエンジン選択").strong());
-        ui.add_space(4.0);
-        let generic_engine_names: Vec<String> = state
-            .config
-            .generic_engines
-            .iter()
-            .map(|engine| engine.name.clone())
-            .collect();
-        ui.horizontal_wrapped(|ui| {
-            // VOICEVOX (fixed)
-            let is_vox = state.config.active_engine == TtsEngineType::Voicevox;
-            if ui.radio(is_vox, "VOICEVOX").clicked() && !is_vox {
-                state.pending_switch_engine = Some(TtsEngineType::Voicevox);
-            }
-            // Voiceger (fixed)
-            let is_vgr = state.config.active_engine == TtsEngineType::Voiceger;
-            if ui.radio(is_vgr, "Voiceger").clicked() && !is_vgr {
-                state.pending_switch_engine = Some(TtsEngineType::Voiceger);
-            }
-            // Generic engines (dynamic)
-            for (i, engine_name) in generic_engine_names.iter().enumerate() {
-                let is_this = state.config.active_engine == TtsEngineType::Generic
-                    && state.config.active_generic_engine_idx == i;
-                if ui.radio(is_this, engine_name).clicked() && !is_this {
-                    state.config.active_generic_engine_idx = i;
-                    state.generic_connected = false;
-                    state.pending_switch_engine = Some(TtsEngineType::Generic);
-                }
-            }
-        });
-        ui.add_space(4.0);
-        // Show active engine connection status inline
-        {
-            let (engine_name, connected, launching) = match state.config.active_engine {
-                TtsEngineType::Voicevox => (
-                    "VOICEVOX".to_string(),
-                    state.voicevox_connected,
-                    state.voicevox_launching,
-                ),
-                TtsEngineType::Voiceger => (
-                    "Voiceger".to_string(),
-                    state.voiceger_connected,
-                    state.voiceger_launching,
-                ),
-                TtsEngineType::Generic => (
-                    state.config.active_generic_name().to_string(),
-                    state.generic_connected,
-                    false,
-                ),
-            };
-            ui.horizontal(|ui| {
-                if connected {
-                    ui.colored_label(
-                        state.config.theme.color(state.config.theme.status_ok),
-                        format!("{}: 接続OK", engine_name),
-                    );
-                } else if launching {
-                    ui.colored_label(
-                        state.config.theme.color(state.config.theme.status_warn),
-                        format!("{}: 起動中...", engine_name),
-                    );
-                } else {
-                    ui.colored_label(
-                        state.config.theme.color(state.config.theme.status_error),
-                        format!("{}: 未接続", engine_name),
-                    );
-                }
-                // Restart button for launchable engines
-                let restart_label = match state.config.active_engine {
-                    TtsEngineType::Voicevox => Some("再起動"),
-                    TtsEngineType::Voiceger => Some("再起動"),
-                    TtsEngineType::Generic => None,
-                };
-                if let Some(label) = restart_label {
-                    if ui.small_button(label).clicked() {
-                        match state.config.active_engine {
-                            TtsEngineType::Voicevox => state.pending_restart_voicevox = true,
-                            TtsEngineType::Voiceger => state.pending_restart_voiceger = true,
-                            TtsEngineType::Generic => {}
-                        }
-                    }
-                }
-            });
-        }
+        show_engine_selector(ui, state);
         ui.separator();
-
         ui.add_space(8.0);
 
-        // ── Engine management ────────────────────────────────────────────────
-        ui.collapsing("エンジン管理", |ui| {
-            // -- VOICEVOX connection --
-            ui.collapsing("VOICEVOX", |ui| {
-                ui.horizontal(|ui| {
-                    ui.label("URL:");
-                    ui.text_edit_singleline(&mut state.config.voicevox_url);
-                });
-                if validation::is_valid_voicevox_url(&state.config.voicevox_url).is_err() {
-                    ui.colored_label(
-                        state.config.theme.color(state.config.theme.status_warn),
-                        "URLはhttp://localhost または http://127.0.0.1 のみ",
-                    );
-                }
-                ui.horizontal(|ui| {
-                    ui.label("実行パス/コマンド:");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut state.config.voicevox_path)
-                            .hint_text("空欄でURLのみ運用（起動時は実行パス/コマンドが必要）"),
-                    );
-                    if ui.button("参照").clicked() {
-                        if let Some(path) = rfd::FileDialog::new().pick_file() {
-                            state.config.voicevox_path = path.to_string_lossy().to_string();
-                        }
-                    }
-                });
-                ui.label(
-                    egui::RichText::new(
-                        "  空欄でも外部起動済みVOICEVOXへのURL接続で利用できます（URLのみ運用）。",
-                    )
-                    .small()
-                    .weak(),
-                );
-                ui.label(
-                    egui::RichText::new(
-                        "  URLのみ運用では「接続テスト」で確認できます。起動/自動起動には実行パス/コマンドが必要です。",
-                    )
-                    .small()
-                    .weak(),
-                );
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    if ui.button("接続テスト").clicked() {
-                        state.pending_health_check = true;
-                    }
-                    if ui.button("VOICEVOX起動").clicked() {
-                        state.pending_launch_voicevox = true;
-                    }
-                    if state.voicevox_connected {
-                        ui.colored_label(
-                            state.config.theme.color(state.config.theme.status_ok),
-                            "接続OK",
-                        );
-                    } else if state.voicevox_launching {
-                        ui.colored_label(
-                            state.config.theme.color(state.config.theme.status_warn),
-                            "起動中...",
-                        );
-                    } else {
-                        ui.colored_label(
-                            state.config.theme.color(state.config.theme.status_error),
-                            "未接続",
-                        );
-                    }
-                });
-            });
-
-            ui.add_space(4.0);
-
-            // -- Voiceger connection --
-            ui.collapsing("Voiceger", |ui| {
-                ui.horizontal(|ui| {
-                    ui.label("URL:");
-                    ui.text_edit_singleline(&mut state.config.voiceger_url);
-                });
-                ui.horizontal(|ui| {
-                    ui.label("起動コマンド:");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut state.config.voiceger_path)
-                            .hint_text("空欄 = ~/voiceger_v2 のデフォルトコマンドを使用"),
-                    );
-                    if ui.button("参照").clicked() {
-                        if let Some(path) = rfd::FileDialog::new().pick_file() {
-                            state.config.voiceger_path = path.to_string_lossy().to_string();
-                            let _ = state.config.save();
-                        }
-                    }
-                });
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    if ui.button("Voiceger起動").clicked() {
-                        state.pending_launch_voiceger = true;
-                    }
-                    if state.voiceger_connected {
-                        ui.colored_label(
-                            state.config.theme.color(state.config.theme.status_ok),
-                            "接続OK",
-                        );
-                    } else if state.voiceger_launching {
-                        ui.colored_label(
-                            state.config.theme.color(state.config.theme.status_warn),
-                            "起動中...",
-                        );
-                    } else {
-                        ui.colored_label(
-                            state.config.theme.color(state.config.theme.status_error),
-                            "未接続",
-                        );
-                    }
-                });
-            });
-
-            ui.add_space(4.0);
-
-            // -- Generic engines --
-            let num_engines = state.config.generic_engines.len();
-            let mut to_delete: Option<usize> = None;
-
-            for i in 0..num_engines {
-                let engine_name = state.config.generic_engines[i].name.clone();
-                ui.collapsing(&engine_name, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("名前:");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut state.config.generic_engines[i].name)
-                                .desired_width(120.0)
-                                .hint_text("エンジン名")
-                                .id_salt(("gen_mgmt_name", i)),
-                        );
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("URL:");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut state.config.generic_engines[i].url)
-                                .desired_width(ui.available_width())
-                                .hint_text("http://localhost:10101")
-                                .id_salt(("gen_mgmt_url", i)),
-                        );
-                    });
-                    ui.add_space(4.0);
-                    ui.horizontal(|ui| {
-                        if ui.button("接続確認").clicked() {
-                            // Temporarily point at this engine for the health check
-                            state.config.active_generic_engine_idx = i;
-                            state.generic_connected = false;
-                            state.pending_health_check_generic = true;
-                        }
-                        let is_active_generic = state.config.active_engine == TtsEngineType::Generic
-                            && state.config.active_generic_engine_idx == i;
-                        if is_active_generic && state.generic_connected {
-                            ui.colored_label(
-                                state.config.theme.color(state.config.theme.status_ok),
-                                "接続OK",
-                            );
-                        } else if is_active_generic {
-                            ui.colored_label(
-                                state.config.theme.color(state.config.theme.status_error),
-                                "未接続",
-                            );
-                        }
-                    });
-                    ui.add_space(4.0);
-                    if ui
-                        .add(egui::Button::new(
-                            egui::RichText::new("このエンジンを削除")
-                                .color(state.config.theme.color(state.config.theme.status_error)),
-                        ))
-                        .clicked()
-                    {
-                        to_delete = Some(i);
-                    }
-                });
-            }
-
-            if let Some(i) = to_delete {
-                state.config.generic_engines.remove(i);
-                if state.config.active_generic_engine_idx >= state.config.generic_engines.len() {
-                    state.config.active_generic_engine_idx =
-                        state.config.generic_engines.len().saturating_sub(1);
-                }
-                // If the deleted engine was active, switch to VOICEVOX
-                if state.config.active_engine == TtsEngineType::Generic
-                    && state.config.generic_engines.is_empty()
-                {
-                    state.pending_switch_engine = Some(TtsEngineType::Voicevox);
-                } else if state.config.active_engine == TtsEngineType::Generic {
-                    state.generic_connected = false;
-                    state.pending_health_check_generic = true;
-                }
-                let _ = state.config.save();
-            }
-
-            ui.add_space(4.0);
-            if num_engines < 20 && ui.button("＋ エンジンを追加").clicked() {
-                state.config.generic_engines.push(GenericEngineConfig {
-                    name: format!("エンジン{}", num_engines + 1),
-                    url: "http://localhost:10101".to_string(),
-                });
-                let _ = state.config.save();
-            }
-        });
+        // ── Engines: one flat section each ─────────────────────────────────
+        ui.collapsing("VOICEVOX", |ui| show_voicevox_section(ui, state));
+        ui.add_space(8.0);
+        ui.collapsing("Voiceger", |ui| show_voiceger_section(ui, state));
+        ui.add_space(8.0);
+        ui.collapsing("その他のエンジン", |ui| show_other_engines_section(ui, state));
 
         ui.add_space(8.0);
 
         // ── General ──────────────────────────────────────────────────────────
         ui.collapsing("General", |ui| {
 
-        // Startup settings (app + VOICEVOX combined)
         ui.collapsing("起動設定", |ui| {
-            // App autostart
             let mut autostart_app = AppConfig::is_autostart_enabled();
-            if ui
-                .checkbox(&mut autostart_app, "システム起動時にアプリを自動起動")
+            if widgets::toggle(ui, &theme, &mut autostart_app, "システム起動時にアプリを自動起動")
                 .changed()
             {
                 state.config.auto_start_app = autostart_app;
@@ -628,36 +914,14 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
                     state.last_error = Some(format!("自動起動設定失敗: {}", e));
                 }
             }
-            ui.label(
-                egui::RichText::new("  ~/.config/autostart/ にデスクトップエントリを配置します")
-                    .small()
-                    .weak(),
-            );
-
-            ui.add_space(4.0);
-
-            // Engine auto-launch (independent per engine)
-            ui.checkbox(
-                &mut state.config.auto_launch_voicevox,
-                "アプリ起動時にVOICEVOXを自動起動",
-            );
-            ui.checkbox(
-                &mut state.config.auto_launch_voiceger,
-                "アプリ起動時にVoicegerを自動起動",
-            );
-            ui.label(
-                egui::RichText::new(
-                    "  両方チェックすると同時起動します",
-                )
-                .small()
-                .weak(),
-            );
+            hint(ui, "  ~/.config/autostart/ にデスクトップエントリを配置します");
+            hint(ui, "  エンジンの自動起動は VOICEVOX / Voiceger の各セクションで設定できます");
         });
 
         ui.add_space(8.0);
 
         ui.collapsing("OSC設定", |ui| {
-            ui.checkbox(&mut state.config.osc_enabled, "OSCチャットボックスを有効化");
+            widgets::toggle(ui, &theme, &mut state.config.osc_enabled, "OSCチャットボックス");
             ui.label("VRChatのチャットボックスにテキストを表示します");
             ui.add_space(4.0);
             ui.horizontal(|ui| {
@@ -678,7 +942,9 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
         ui.add_space(8.0);
 
         ui.collapsing("テンプレート", |ui| {
-            ui.checkbox(
+            widgets::toggle(
+                ui,
+                &theme,
                 &mut state.config.templates_default_expanded,
                 "起動時にテンプレートを展開した状態にする",
             );
@@ -759,355 +1025,34 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
 
         ui.add_space(8.0);
 
-        // ── VOICEVOX ─────────────────────────────────────────────────────────
-        ui.collapsing("VOICEVOX", |ui| {
-
-        let is_voicevox_active = state.config.active_engine == TtsEngineType::Voicevox;
-        if !is_voicevox_active {
-            show_inactive_notice(ui, state);
-        }
-
-        ui.add_enabled_ui(is_voicevox_active, |ui| {
-
-        ui.add_space(8.0);
-
-        // Voice parameters
-        ui.collapsing("音声パラメータ", |ui| {
-            let params = &mut state.config.synth_params;
-            ui.horizontal(|ui| {
-                ui.label("速度:");
-                ui.add(egui::Slider::new(&mut params.speed_scale, 0.5..=2.0).step_by(0.05));
-            });
-            ui.horizontal(|ui| {
-                ui.label("ピッチ:");
-                ui.add(egui::Slider::new(&mut params.pitch_scale, -0.15..=0.15).step_by(0.01));
-            });
-            ui.horizontal(|ui| {
-                ui.label("抑揚:");
-                ui.add(egui::Slider::new(&mut params.intonation_scale, 0.0..=2.0).step_by(0.05));
-            });
-            ui.horizontal(|ui| {
-                ui.label("音量:");
-                ui.add(egui::Slider::new(&mut params.volume_scale, 0.0..=2.0).step_by(0.05));
-            });
-            if ui.button("デフォルトに戻す").clicked() {
-                *params = crate::config::SynthParamsConfig::default();
-            }
-        });
-
-        ui.add_space(8.0);
-
-        // Speaker presets
-        ui.collapsing("VOICEVOXプリセット", |ui| {
-            show_preset_section(ui, state, &TtsEngineType::Voicevox, None);
-        });
-
-        ui.add_space(8.0);
-
-        // VOICEVOX dictionary
-        ui.collapsing("VOICEVOX辞書", |ui| {
-            if state.voicevox_connected {
-                ui.horizontal(|ui| {
-                    if ui.button("辞書を読み込む").clicked() {
-                        state.pending_load_user_dict = true;
-                    }
-                    ui.label(
-                        egui::RichText::new("(読み込んでいただくことで既存の割り当てを見られます)")
-                            .small()
-                            .weak(),
-                    );
-                });
-                ui.add_space(4.0);
-
-                let mut to_delete = None;
-                for (uuid, surface, pronunciation) in &state.user_dict {
-                    ui.horizontal(|ui| {
-                        ui.label(format!("{} → {}", surface, pronunciation));
-                        if ui.small_button("削除").clicked() {
-                            to_delete = Some(uuid.clone());
-                        }
-                    });
-                }
-                if let Some(uuid) = to_delete {
-                    state.pending_delete_dict_word = Some(uuid);
-                }
-
-                ui.add_space(4.0);
-                ui.separator();
-
-                ui.horizontal(|ui| {
-                    ui.label("表記:");
-                    ui.add(egui::TextEdit::singleline(&mut state.new_dict_surface).desired_width(100.0));
-                    ui.label("読み:");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut state.new_dict_pronunciation)
-                            .desired_width(100.0),
-                    );
-                    if ui.button("追加").clicked()
-                        && !state.new_dict_surface.trim().is_empty()
-                        && !state.new_dict_pronunciation.trim().is_empty()
-                    {
-                        let surface = state.new_dict_surface.trim().to_string();
-                        let pronunciation = state.new_dict_pronunciation.trim().to_string();
-                        state.pending_add_dict_word = Some((surface, pronunciation));
-                        state.new_dict_surface.clear();
-                        state.new_dict_pronunciation.clear();
-                    }
-                });
-            } else {
-                ui.label("VOICEVOXに接続してください");
-            }
-        });
-
-        }); // add_enabled_ui VOICEVOX
-
-        }); // VOICEVOX
-
-        ui.add_space(8.0);
-
-        // ── Voiceger ─────────────────────────────────────────────────────────
-        ui.collapsing("Voiceger", |ui| {
-
-        let is_voiceger_active = state.config.active_engine == TtsEngineType::Voiceger;
-        if !is_voiceger_active {
-            show_inactive_notice(ui, state);
-        }
-
-        // Voiceger-specific reference audio settings (always editable)
-        ui.collapsing("参照音声設定", |ui| {
-            ui.horizontal(|ui| {
-                ui.label("参照音声:");
-                ui.add(
-                    egui::TextEdit::singleline(&mut state.config.voiceger_ref_audio)
-                        .hint_text("参照音声のパス"),
-                );
-                if ui.button("参照").clicked() {
-                    if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("音声ファイル", &["wav", "flac", "mp3", "ogg", "m4a", "aac"])
-                        .pick_file()
-                    {
-                        state.config.voiceger_ref_audio = path.to_string_lossy().to_string();
-                        let _ = state.config.save();
-                    }
-                }
-            });
-            ui.label(
-                egui::RichText::new("⚠ WAV・FLACを推奨。MP3・AACは非可逆圧縮のため高周波が欠落し、声質の再現精度が下がる場合があります。")
-                    .small()
-                    .weak(),
-            );
-            ui.horizontal(|ui| {
-                ui.label("参照言語:");
-                egui::ComboBox::from_id_salt("voiceger_prompt_lang")
-                    .selected_text(&state.config.voiceger_prompt_lang)
-                    .show_ui(ui, |ui| {
-                        for (code, name, _) in VOICEGER_LANGUAGES {
-                            ui.selectable_value(
-                                &mut state.config.voiceger_prompt_lang,
-                                code.to_string(),
-                                *name,
-                            );
-                        }
-                    });
-            });
-            ui.checkbox(
-                &mut state.config.voiceger_ref_free,
-                "参照なしモード (ref_free) を常時有効",
-            );
-            ui.label(
-                egui::RichText::new(
-                    "※ ON で参照音声/参照テキストを使わず合成します。短い英字入力（例: wa）や短い日本語（例: いいかな？）は、長文中の一節でもOFF時に自動で参照なしへ切り替わります。",
-                )
-                .small()
-                .weak(),
-            );
-            ui.horizontal(|ui| {
-                ui.label("参照テキスト:");
-                let resp = ui.add(
-                    egui::TextEdit::singleline(&mut state.config.voiceger_prompt_text)
-                        .hint_text("参照音声が喋っている内容"),
-                );
-                if resp.lost_focus() {
-                    let _ = state.config.save();
-                }
-            });
-            ui.add_space(4.0);
-            if ui.button("デフォルトに戻す").clicked() {
-                state.config.reset_voiceger_defaults();
-                let _ = state.config.save();
-            }
-            ui.label(
-                egui::RichText::new(
-                    "  参照音声は {voicegerのフォルダ}/reference/ 以下にあります",
-                )
-                .small()
-                .weak(),
-            );
-        });
-
-        ui.add_enabled_ui(is_voiceger_active, |ui| {
-
-        ui.add_space(8.0);
-
-        // Voiceger presets (with emotion selection)
-        ui.collapsing("Voicegerプリセット", |ui| {
-            show_preset_section(ui, state, &TtsEngineType::Voiceger, None);
-        });
-
-        ui.add_space(8.0);
-
-        // Voiceger dictionary: per-language pronunciation replacements + shared silent words
-        ui.collapsing("Voiceger辞書", |ui| {
-            ui.label(
-                egui::RichText::new("送信前にテキストを置換します（言語ごとに独立）")
-                    .small()
-                    .weak(),
-            );
-            ui.add_space(4.0);
-
-            // Language selector tabs
-            ui.horizontal(|ui| {
-                for (code, name, _) in crate::tts::voiceger::VOICEGER_LANGUAGES {
-                    let selected = state.voiceger_dict_lang == *code;
-                    if ui.selectable_label(selected, *name).clicked() {
-                        state.voiceger_dict_lang = code.to_string();
-                    }
-                }
-            });
-            ui.separator();
-
-            let lang = state.voiceger_dict_lang.clone();
-
-            // Entries for selected language
-            let mut to_delete_key: Option<String> = None;
-            if let Some(lang_dict) = state.config.voiceger_dict.get(&lang) {
-                let mut sorted: Vec<(String, String)> = lang_dict.iter().map(|(k,v)|(k.clone(),v.clone())).collect();
-                sorted.sort_by(|a,b| a.0.cmp(&b.0));
-                for (surface, reading) in &sorted {
-                    ui.horizontal(|ui| {
-                        ui.label(format!("{} → {}", surface, reading));
-                        if ui.small_button("削除").clicked() {
-                            to_delete_key = Some(surface.clone());
-                        }
-                    });
-                }
-            }
-            if let Some(key) = to_delete_key {
-                if let Some(d) = state.config.voiceger_dict.get_mut(&lang) {
-                    d.remove(&key);
-                }
-                let _ = state.config.save();
-            }
-
-            // Silent words (shared across engines)
-            if !state.config.silent_words.is_empty() {
-                ui.add_space(4.0);
-                ui.label(
-                    egui::RichText::new("無音化（両エンジン共通）")
-                        .size(9.0)
-                        .color(state.config.theme.color(state.config.theme.text_muted)),
-                );
-                let mut silent_to_delete = None;
-                for (i, word) in state.config.silent_words.iter().enumerate() {
-                    ui.horizontal(|ui| {
-                        ui.label(format!("{} → (無音)", word));
-                        if ui.small_button("削除").clicked() { silent_to_delete = Some(i); }
-                    });
-                }
-                if let Some(idx) = silent_to_delete {
-                    state.config.silent_words.remove(idx);
-                    let _ = state.config.save();
-                }
-            }
-
-            ui.add_space(4.0);
-            ui.separator();
-
-            // Add new entry
-            ui.horizontal(|ui| {
-                ui.label("表記:");
-                ui.add(egui::TextEdit::singleline(&mut state.new_dict_surface).desired_width(90.0));
-                ui.label("読み:");
-                ui.add(
-                    egui::TextEdit::singleline(&mut state.new_dict_pronunciation)
-                        .desired_width(90.0)
-                        .hint_text("{silent}で無音化"),
-                );
-                if ui.button("追加").clicked()
-                    && !state.new_dict_surface.trim().is_empty()
-                    && !state.new_dict_pronunciation.trim().is_empty()
-                {
-                    let surface = state.new_dict_surface.trim().to_string();
-                    let reading = state.new_dict_pronunciation.trim().to_string();
-                    if reading == "{silent}" {
-                        if !state.config.silent_words.contains(&surface) {
-                            state.config.silent_words.push(surface);
-                        }
-                    } else {
-                        state.config.voiceger_dict
-                            .entry(lang.clone())
-                            .or_default()
-                            .insert(surface, reading);
-                    }
-                    let _ = state.config.save();
-                    state.new_dict_surface.clear();
-                    state.new_dict_pronunciation.clear();
-                }
-            });
-        });
-
-        }); // add_enabled_ui Voiceger
-
-        }); // Voiceger
-
-        // ── Generic engine sections (auto-generated) ─────────────────────────
-        let generic_engine_names: Vec<String> = state
-            .config
-            .generic_engines
-            .iter()
-            .map(|engine| engine.name.clone())
-            .collect();
-        for (i, engine_name) in generic_engine_names.iter().enumerate() {
-            let is_this_active = state.config.active_engine == TtsEngineType::Generic
-                && state.config.active_generic_engine_idx == i;
-
-            ui.add_space(8.0);
-
-            ui.collapsing(engine_name, |ui| {
-                if !is_this_active {
-                    show_inactive_notice(ui, state);
-                }
-
-                ui.label(
-                    egui::RichText::new(
-                        "VOICEVOX互換のAPIを持つ外部エンジン。\n\
-                         エンジン側で /speakers, /audio_query, /synthesis エンドポイントを提供してください。",
-                    )
-                    .small()
-                    .weak(),
-                );
-                ui.add_space(4.0);
-
-                ui.add_enabled_ui(is_this_active, |ui| {
-                    ui.collapsing(format!("{}プリセット", engine_name), |ui| {
-                        show_preset_section(ui, state, &TtsEngineType::Generic, Some(engine_name));
-                    });
-                });
-            });
-        }
-
-        ui.add_space(8.0);
-
         // ── Audio ─────────────────────────────────────────────────────────────
         ui.collapsing("Audio", |ui| {
 
         // Audio monitoring
         ui.collapsing("オーディオ", |ui| {
-            ui.checkbox(
+            widgets::toggle(
+                ui,
+                &theme,
                 &mut state.config.monitor_audio,
                 "自分にも音声を再生（モニター）",
             );
-            ui.label("有効にすると、仮想マイクに加えてスピーカーからも音声が聞こえます");
+            hint(ui, "ON: 仮想マイクに加えてスピーカーからも音声が聞こえます");
+
+            ui.add_space(4.0);
+            if widgets::toggle(
+                ui,
+                &theme,
+                &mut state.config.use_as_default_input,
+                "ZunduxマイクをPCの既定の入力デバイスにする",
+            )
+            .changed()
+            {
+                let _ = state.config.save();
+            }
+            hint(
+                ui,
+                "ON: 入力デバイスを選べないアプリでもZunduxの音声がマイクとして使われます。OFFにするかアプリ終了時に元の入力へ戻します。",
+            );
 
             ui.add_space(8.0);
             ui.separator();
@@ -1162,12 +1107,12 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
             let rnnoise_available =
                 crate::audio::virtual_device::VirtualDevice::is_rnnoise_available();
             let old_ns = state.config.noise_suppression;
-            ui.add_enabled(
+            widgets::toggle_enabled(
+                ui,
+                &theme,
                 rnnoise_available,
-                egui::Checkbox::new(
-                    &mut state.config.noise_suppression,
-                    "ノイズキャンセル (RNNoise)",
-                ),
+                &mut state.config.noise_suppression,
+                "ノイズキャンセル (RNNoise)",
             );
             if !rnnoise_available {
                 ui.label(
@@ -1193,7 +1138,9 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
         ui.add_space(8.0);
 
         ui.collapsing("音声エフェクト", |ui| {
-            ui.checkbox(&mut state.config.echo_enabled, "エコーを有効化");
+            if widgets::toggle(ui, &theme, &mut state.config.echo_enabled, "エコー").changed() {
+                let _ = state.config.save();
+            }
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 ui.label("遅延(ms):");
@@ -1203,6 +1150,25 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
                 ui.label("減衰:");
                 ui.add(egui::Slider::new(&mut state.config.echo_decay, 0.1..=0.8).step_by(0.05));
             });
+            ui.add_space(4.0);
+            if widgets::toggle(
+                ui,
+                &theme,
+                &mut state.config.effects_tts_only,
+                "音声効果を合成音声のみに適用",
+            )
+            .changed()
+            {
+                let _ = state.config.save();
+            }
+            hint(
+                ui,
+                if state.config.effects_tts_only {
+                    "ON: エコーは合成音声だけに掛かり、マイク入力はそのまま流れます"
+                } else {
+                    "OFF: エコーは合成音声とマイク入力（MIC: ON 時）の両方に掛かります"
+                },
+            );
         });
 
         ui.add_space(8.0);

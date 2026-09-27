@@ -49,6 +49,7 @@ The app has two concurrency contexts that communicate via `std::sync::mpsc` chan
 ### Audio pipeline
 1. `VirtualDevice` (`src/audio/virtual_device.rs`) creates a PulseAudio null sink via `pactl load-module module-null-sink`. VRChat should be configured to use the monitor source (`<sink_name>.monitor`) as its microphone input.
 2. `playback::play_wav` (`src/audio/playback.rs`) plays TTS WAV through `paplay` to the configured virtual sink. Monitor playback to speakers is handled separately.
+3. Mic passthrough (MIC: ON) uses `module-loopback` into the sink. When echo is enabled and `effects_tts_only` is false, it instead runs `parec → echo → pacat` (`src/audio/mic_effects.rs`); delay/decay are shared atomics updated every frame.
 
 ### TTS abstraction (`src/tts/`)
 `TtsEngine` trait with `list_speakers`, `synthesize`, `health_check`. Only `VoicevoxEngine` is implemented. Synthesis is a two-step VOICEVOX API call: `POST /audio_query` then `POST /synthesis`.

@@ -1,5 +1,7 @@
+use super::mic_effects::{MicEchoParams, MicEffectPipeline};
 use anyhow::{Context, Result};
 use std::process::Command;
+use std::sync::Arc;
 
 pub struct VirtualDevice {
     pub(crate) sink_name: String,
@@ -7,6 +9,10 @@ pub struct VirtualDevice {
     source_module_id: Option<u32>,
     loopback_module_id: Option<u32>,
     ladspa_module_id: Option<u32>,
+    /// Used instead of the loopback module when effects are applied to the mic.
+    mic_pipeline: Option<MicEffectPipeline>,
+    /// System default source before we replaced it with our virtual mic.
+    previous_default_source: Option<String>,
 }
 
 impl VirtualDevice {
@@ -17,6 +23,8 @@ impl VirtualDevice {
             source_module_id: None,
             loopback_module_id: None,
             ladspa_module_id: None,
+            mic_pipeline: None,
+            previous_default_source: None,
         }
     }
 
@@ -177,19 +185,98 @@ impl VirtualDevice {
 
     /// Whether the real microphone is currently being passed through to the virtual sink.
     pub fn is_mic_passthrough(&self) -> bool {
-        self.loopback_module_id.is_some()
+        self.loopback_module_id.is_some() || self.mic_pipeline.is_some()
+    }
+
+    fn default_source() -> Option<String> {
+        let output = Command::new("pactl")
+            .arg("get-default-source")
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        (!name.is_empty()).then_some(name)
+    }
+
+    fn set_default_source_to(name: &str) -> Result<()> {
+        let output = Command::new("pactl")
+            .args(["set-default-source", name])
+            .output()
+            .context("Failed to run pactl set-default-source")?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("pactl set-default-source failed: {}", stderr.trim());
+        }
+        Ok(())
+    }
+
+    /// Whether `name` is one of the sources this device exposes (virtual mic,
+    /// sink monitor or the denoised intermediate source).
+    pub fn is_own_source(&self, name: &str) -> bool {
+        name == self.source_name()
+            || name == format!("{}.monitor", self.sink_name)
+            || name == self.denoised_source_name()
+    }
+
+    /// The real default input from before [`Self::set_as_default_source`], if we replaced it.
+    pub fn previous_default_source(&self) -> Option<&str> {
+        self.previous_default_source.as_deref()
+    }
+
+    /// Make the virtual mic the system default input, so apps that cannot pick an
+    /// input device (they always record "the PC's microphone") hear Zundux.
+    /// The previous default is remembered and restored by [`Self::restore_default_source`].
+    pub fn set_as_default_source(&mut self) -> Result<()> {
+        let target = if self.virtual_source_exists().unwrap_or(false) {
+            self.source_name()
+        } else {
+            format!("{}.monitor", self.sink_name)
+        };
+        let current = Self::default_source();
+        if current.as_deref() == Some(target.as_str()) {
+            return Ok(());
+        }
+        Self::set_default_source_to(&target)?;
+        // Keep the very first "real" default so repeated calls don't overwrite it.
+        if self.previous_default_source.is_none() {
+            self.previous_default_source = current;
+        }
+        tracing::info!("System default input set to {}", target);
+        Ok(())
+    }
+
+    /// Undo [`Self::set_as_default_source`] if the default still points at us.
+    pub fn restore_default_source(&mut self) {
+        let Some(previous) = self.previous_default_source.take() else {
+            return;
+        };
+        let ours = [self.source_name(), format!("{}.monitor", self.sink_name)];
+        let still_ours = Self::default_source()
+            .map(|cur| ours.contains(&cur))
+            .unwrap_or(false);
+        if still_ours {
+            match Self::set_default_source_to(&previous) {
+                Ok(()) => tracing::info!("System default input restored to {}", previous),
+                Err(e) => tracing::warn!("Failed to restore default input: {}", e),
+            }
+        }
     }
 
     /// Enable real microphone passthrough: routes a specific PulseAudio source
     /// into the virtual sink so VRChat hears the real mic instead of TTS.
     /// When `noise_suppression` is true and RNNoise is available, an intermediate
     /// LADSPA source is created to denoise the mic before routing.
+    /// When `echo` is set, the mic goes through [`MicEffectPipeline`] so the same
+    /// echo as the TTS voice is applied; if that fails we fall back to a plain loopback.
     pub fn enable_mic_passthrough(
         &mut self,
         source_name: &str,
         noise_suppression: bool,
+        echo: Option<Arc<MicEchoParams>>,
     ) -> Result<()> {
-        if self.loopback_module_id.is_some() {
+        if self.is_mic_passthrough() {
             return Ok(()); // Already enabled
         }
 
@@ -228,6 +315,20 @@ impl VirtualDevice {
             }
             source_name.to_string()
         };
+
+        if let Some(params) = echo {
+            match MicEffectPipeline::start(&effective_source, &self.sink_name, params) {
+                Ok(pipeline) => {
+                    self.mic_pipeline = Some(pipeline);
+                    tracing::info!("Mic passthrough enabled with echo");
+                    return Ok(());
+                }
+                Err(e) => tracing::warn!(
+                    "Mic effect pipeline unavailable ({:#}), falling back to loopback without echo",
+                    e
+                ),
+            }
+        }
 
         let output = Command::new("pactl")
             .args([
@@ -270,6 +371,8 @@ impl VirtualDevice {
 
     /// Disable real microphone passthrough.
     pub fn disable_mic_passthrough(&mut self) -> Result<()> {
+        // Dropping the pipeline stops parec/pacat.
+        self.mic_pipeline = None;
         if let Some(id) = self.loopback_module_id.take() {
             let output = Command::new("pactl")
                 .args(["unload-module", &id.to_string()])
@@ -320,6 +423,7 @@ impl VirtualDevice {
     }
 
     pub fn destroy(&mut self) -> Result<()> {
+        self.restore_default_source();
         // Destroy loopback and LADSPA first
         let _ = self.disable_mic_passthrough();
         self.unload_ladspa();
@@ -358,6 +462,8 @@ impl Drop for VirtualDevice {
         // Leaving them loaded means VRChat retains its microphone connection and
         // does not require a manual mic-toggle after the app is restarted.
         // Only the loopback and LADSPA modules are transient and must be cleaned up.
+        // The default input is handed back so the real mic is used again after exit.
+        self.restore_default_source();
         let _ = self.disable_mic_passthrough();
         self.unload_ladspa();
         // Forget the module IDs so destroy() (if called explicitly) is a no-op for

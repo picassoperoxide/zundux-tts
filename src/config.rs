@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value as JsonValue};
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
@@ -75,6 +76,13 @@ pub struct AppConfig {
     pub echo_enabled: bool,
     pub echo_delay_ms: u32,
     pub echo_decay: f64,
+    /// true = 音声エフェクト（エコー等）を合成音声のみに適用し、マイク入力には掛けない。
+    /// false (default) = マイク入力にも同じエフェクトを掛ける。
+    #[serde(default)]
+    pub effects_tts_only: bool,
+    /// Zunduxの仮想マイクをシステム（PC）の既定の入力デバイスにする。
+    #[serde(default)]
+    pub use_as_default_input: bool,
     #[serde(default = "default_target_lufs")]
     pub target_lufs: f64,
     #[serde(default = "default_loudness_tolerance")]
@@ -353,6 +361,8 @@ impl Default for AppConfig {
             echo_enabled: false,
             echo_delay_ms: 200,
             echo_decay: 0.4,
+            effects_tts_only: false,
+            use_as_default_input: false,
             target_lufs: -14.0,
             loudness_tolerance: 3.0,
             soundboard_gains: std::collections::HashMap::new(),
@@ -595,7 +605,7 @@ impl AppConfig {
             .with_context(|| format!("Failed to read config: {}", path.display()))?;
         let mut config: Self =
             toml::from_str(&content).with_context(|| "Failed to parse config TOML")?;
-        config.validate_and_sanitize();
+        config.validate_and_sanitize_with(&Self::top_level_keys(&content));
         Ok(config)
     }
 
@@ -614,20 +624,43 @@ impl AppConfig {
         }
     }
 
-    fn apply_engine_configs_to_legacy(&mut self) {
+    /// Keys set directly at the top level of a config TOML file.
+    fn top_level_keys(content: &str) -> HashSet<String> {
+        content
+            .parse::<toml::Table>()
+            .map(|t| t.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Copy `[engine_configs.*]` values into the legacy flat fields.
+    ///
+    /// A legacy field that is written explicitly at the top level of the file
+    /// (e.g. `voiceger_path` set by install.sh or a manual edit) wins over the
+    /// mirrored value in `engine_configs`. Otherwise a stale `path = ""` there
+    /// silently discards the real launch command and Voiceger can no longer start.
+    fn apply_engine_configs_to_legacy(&mut self, top_level_keys: &HashSet<String>) {
+        let use_mirror = |legacy_key: &str| !top_level_keys.contains(legacy_key);
+
         if let Some(voicevox) = self
             .engine_configs
             .get(ENGINE_ID_VOICEVOX)
             .and_then(JsonValue::as_object)
+            .cloned()
         {
-            if let Some(url) = voicevox.get("url").and_then(JsonValue::as_str) {
-                self.voicevox_url = url.to_string();
+            if use_mirror("voicevox_url") {
+                if let Some(url) = voicevox.get("url").and_then(JsonValue::as_str) {
+                    self.voicevox_url = url.to_string();
+                }
             }
-            if let Some(path) = voicevox.get("path").and_then(JsonValue::as_str) {
-                self.voicevox_path = path.to_string();
+            if use_mirror("voicevox_path") {
+                if let Some(path) = voicevox.get("path").and_then(JsonValue::as_str) {
+                    self.voicevox_path = path.to_string();
+                }
             }
-            if let Some(auto_launch) = voicevox.get("auto_launch").and_then(JsonValue::as_bool) {
-                self.auto_launch_voicevox = auto_launch;
+            if use_mirror("auto_launch_voicevox") {
+                if let Some(v) = voicevox.get("auto_launch").and_then(JsonValue::as_bool) {
+                    self.auto_launch_voicevox = v;
+                }
             }
         }
 
@@ -635,34 +668,54 @@ impl AppConfig {
             .engine_configs
             .get(ENGINE_ID_VOICEGER)
             .and_then(JsonValue::as_object)
+            .cloned()
         {
-            if let Some(url) = voiceger.get("url").and_then(JsonValue::as_str) {
-                self.voiceger_url = url.to_string();
+            if use_mirror("voiceger_url") {
+                if let Some(url) = voiceger.get("url").and_then(JsonValue::as_str) {
+                    self.voiceger_url = url.to_string();
+                }
             }
-            if let Some(path) = voiceger.get("path").and_then(JsonValue::as_str) {
-                self.voiceger_path = path.to_string();
+            if use_mirror("voiceger_path") {
+                if let Some(path) = voiceger.get("path").and_then(JsonValue::as_str) {
+                    self.voiceger_path = path.to_string();
+                }
             }
-            if let Some(auto_launch) = voiceger.get("auto_launch").and_then(JsonValue::as_bool) {
-                self.auto_launch_voiceger = auto_launch;
+            if use_mirror("auto_launch_voiceger") {
+                if let Some(v) = voiceger.get("auto_launch").and_then(JsonValue::as_bool) {
+                    self.auto_launch_voiceger = v;
+                }
             }
-            if let Some(ref_audio) = voiceger.get("ref_audio").and_then(JsonValue::as_str) {
-                self.voiceger_ref_audio = ref_audio.to_string();
+            if use_mirror("voiceger_ref_audio") {
+                if let Some(v) = voiceger.get("ref_audio").and_then(JsonValue::as_str) {
+                    self.voiceger_ref_audio = v.to_string();
+                }
             }
-            if let Some(prompt_text) = voiceger.get("prompt_text").and_then(JsonValue::as_str) {
-                self.voiceger_prompt_text = prompt_text.to_string();
+            if use_mirror("voiceger_prompt_text") {
+                if let Some(v) = voiceger.get("prompt_text").and_then(JsonValue::as_str) {
+                    self.voiceger_prompt_text = v.to_string();
+                }
             }
-            if let Some(prompt_lang) = voiceger.get("prompt_lang").and_then(JsonValue::as_str) {
-                self.voiceger_prompt_lang = prompt_lang.to_string();
+            if use_mirror("voiceger_prompt_lang") {
+                if let Some(v) = voiceger.get("prompt_lang").and_then(JsonValue::as_str) {
+                    self.voiceger_prompt_lang = v.to_string();
+                }
             }
-            if let Some(ref_free) = voiceger.get("ref_free").and_then(JsonValue::as_bool) {
-                self.voiceger_ref_free = ref_free;
+            if use_mirror("voiceger_ref_free") {
+                if let Some(v) = voiceger.get("ref_free").and_then(JsonValue::as_bool) {
+                    self.voiceger_ref_free = v;
+                }
             }
-            if let Some(dict) = voiceger.get("dict") {
-                if let Ok(dict) = serde_json::from_value::<
-                    std::collections::HashMap<String, std::collections::HashMap<String, String>>,
-                >(dict.clone())
-                {
-                    self.voiceger_dict = dict;
+            if use_mirror("voiceger_dict") {
+                if let Some(dict) = voiceger.get("dict") {
+                    if let Ok(dict) = serde_json::from_value::<
+                        std::collections::HashMap<
+                            String,
+                            std::collections::HashMap<String, String>,
+                        >,
+                    >(dict.clone())
+                    {
+                        self.voiceger_dict = dict;
+                    }
                 }
             }
         }
@@ -671,25 +724,34 @@ impl AppConfig {
             .engine_configs
             .get(ENGINE_ID_GENERIC)
             .and_then(JsonValue::as_object)
+            .cloned()
         {
-            if let Some(engines) = generic.get("engines") {
-                if let Ok(engines) =
-                    serde_json::from_value::<Vec<GenericEngineConfig>>(engines.clone())
-                {
-                    self.generic_engines = engines;
+            if use_mirror("generic_engines") {
+                if let Some(engines) = generic.get("engines") {
+                    if let Ok(engines) =
+                        serde_json::from_value::<Vec<GenericEngineConfig>>(engines.clone())
+                    {
+                        self.generic_engines = engines;
+                    }
                 }
             }
-            if let Some(idx) = generic.get("active_engine_idx").and_then(JsonValue::as_u64) {
-                self.active_generic_engine_idx = idx as usize;
+            if use_mirror("active_generic_engine_idx") {
+                if let Some(idx) = generic.get("active_engine_idx").and_then(JsonValue::as_u64) {
+                    self.active_generic_engine_idx = idx as usize;
+                }
             }
-            if let Some(speaker_id) = generic.get("speaker_id").and_then(JsonValue::as_u64) {
-                self.generic_speaker_id = speaker_id as u32;
+            if use_mirror("generic_speaker_id") {
+                if let Some(id) = generic.get("speaker_id").and_then(JsonValue::as_u64) {
+                    self.generic_speaker_id = id as u32;
+                }
             }
-            if let Some(synth_params) = generic.get("synth_params") {
-                if let Ok(synth_params) =
-                    serde_json::from_value::<SynthParamsConfig>(synth_params.clone())
-                {
-                    self.generic_synth_params = synth_params;
+            if use_mirror("generic_synth_params") {
+                if let Some(synth_params) = generic.get("synth_params") {
+                    if let Ok(synth_params) =
+                        serde_json::from_value::<SynthParamsConfig>(synth_params.clone())
+                    {
+                        self.generic_synth_params = synth_params;
+                    }
                 }
             }
         }
@@ -795,9 +857,14 @@ impl AppConfig {
         self.sync_engine_configs_from_legacy();
     }
 
+    #[cfg(test)]
     fn validate_and_sanitize(&mut self) {
+        self.validate_and_sanitize_with(&HashSet::new());
+    }
+
+    fn validate_and_sanitize_with(&mut self, top_level_keys: &HashSet<String>) {
         self.sync_active_engine_compat_fields();
-        self.apply_engine_configs_to_legacy();
+        self.apply_engine_configs_to_legacy(top_level_keys);
 
         if !validation::is_valid_device_name(&self.virtual_device_name) {
             tracing::warn!(
@@ -1026,6 +1093,46 @@ synth_params = { speed_scale = 1.1, pitch_scale = 0.1, intonation_scale = 1.2, v
                 .get("key")
                 .and_then(JsonValue::as_str),
             Some("value")
+        );
+    }
+
+    #[test]
+    fn explicit_top_level_fields_win_over_stale_engine_configs() {
+        // Reproduces a config where install.sh rewrote the top-level voiceger_path
+        // while the app-maintained [engine_configs.voiceger] still had an empty path.
+        let raw = r#"
+voiceger_path = "/home/user/miniconda3/envs/voiceger/bin/python /home/user/voiceger_v2/GPT-SoVITS/api_v2.py"
+voiceger_ref_audio = "/home/user/voiceger_v2/reference/01_ref_emoNormal026.wav"
+
+[engine_configs.voiceger]
+url = "http://localhost:19999"
+path = ""
+ref_audio = ""
+auto_launch = true
+"#;
+
+        let mut config: AppConfig = toml::from_str(raw).expect("parse toml");
+        config.validate_and_sanitize_with(&AppConfig::top_level_keys(raw));
+
+        assert_eq!(
+            config.voiceger_path,
+            "/home/user/miniconda3/envs/voiceger/bin/python /home/user/voiceger_v2/GPT-SoVITS/api_v2.py"
+        );
+        assert_eq!(
+            config.voiceger_ref_audio,
+            "/home/user/voiceger_v2/reference/01_ref_emoNormal026.wav"
+        );
+        // Values not set at the top level still come from engine_configs.
+        assert_eq!(config.voiceger_url, "http://localhost:19999");
+        assert!(config.auto_launch_voiceger);
+        // And the mirror is brought back in sync for the next save.
+        assert_eq!(
+            config
+                .engine_configs
+                .get(ENGINE_ID_VOICEGER)
+                .and_then(|v| v.get("path"))
+                .and_then(JsonValue::as_str),
+            Some(config.voiceger_path.as_str())
         );
     }
 
